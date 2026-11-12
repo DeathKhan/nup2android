@@ -1,0 +1,46 @@
+# The Legend of Zelda: Ocarina of Time (Nintendo Switch 2 Edition; NVN2, Ampere shaders) on Android: an untested first profile written with the nxnative upsync of 2026-11-08
+# (upstream to 7f5022200). Rows are those of the other Switch 2 profiles (Donkey Kong Bananza, Welcome Tour) whose reason holds for any Switch 2 game on the Odin 3; nothing here is
+# tuned for this game yet. Upstream's Ocarina fixes that reach Android: the frame step stubs (patches.py, MATCH_FRAME_STEP), the dynamic-resolution stub (DM_DYNAMIC_RESOLUTION),
+# raw 128-bit global loads as one vector load (translator), the colour write mask from the pixel shader's output map (gfx_vk_exec.c, needs a rebuilt shader bundle),
+# timestamp reports known until they land for its conditional rendering (render_cond on in game.tsv)
+status	experimental
+package	org.nx2a.t0400486024dec000
+orientation	landscape
+# Handheld mode: on the Odin's 1080p screen the game targets its handheld resolution instead of the docked one (as Bananza and Welcome Tour)
+setting	docked=0
+setting	overlay=1
+setting	fps=1
+# The replay on its own thread (as Bananza)
+env	DM_NVN_ASYNC=1
+# The host's adaptive frame rate off, as the other Switch 2 profiles. Proposal to check: with upstream's frame step stubs this game's step is the host's, so a 40 fps step may run at
+# the right speed here, unlike Bananza
+env	DM_ADAPTIVE_FPS=0
+# DM_VK_PART_PACE: the backend default (on)
+# Proposals for an A/B on the device, not set:
+#   env DM_DYNAMIC_RESOLUTION=1   the game's dynamic resolution through upstream's climbing stub (0, the default, holds 1536x864)
+#   env DM_VK_RC_QUEUE=1          render-enable state kept per NVN queue across submissions, as upstream's logical queues do (the queue-ordering fix for its flashes is Apple-only)
+#   env DM_GPU_MIN_FREQ=967000000 the GPU clock floor the other Switch 2 profiles use (PServerBinder, else su)
+# Movies (2026-11-08, Odin 3): the AV1 movies decode on MediaCodec (c2.qti.av1.decoder; the game reads the pictures on the CPU, so they go through NV12 copies into its linear
+# textures). The NDVE enhancement network the game runs over each decoded picture (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs, 22 compute shaders of 0.15-1.8 MB of SPIR-V with up to
+# 1,000 subgroup shuffles) does not build on Adreno 830's driver: vkCreateComputePipelines fails on e6be82d835fbe4d3 and throws std::bad_alloc on d15370a382630d4e, which ends the app.
+# Its stages are left out. The final title output instead receives the decoded picture through the tested movie-fill path below; enhancement is not reproduced.
+env	DM_VK_SKIP_CS=c2fc2ddd604c25e7,4f41ccf24f163e0d,ba079f68ae288dba,a8b4fb48fee0ccf8,e2eebd7ba18fe35f,e6be82d835fbe4d3,9442573ee4ace011,0a56002cdc7e1fce,d15370a382630d4e,7f7ff0f36b54d90f,5a7d69b067a7f011,329e4b0f0b3f2bc6,7653fe5f6ef0b2f2,b6e34b46dea44278,3f18f89630c05813,539ad3b353758de0,d72077c4b6cc264f,ab9a92b55950ec02,c41f451b88a050f6,55ee6dc89a2b64e2,49dff010b9832251,8e98d86c0e4a7b53
+env	DM_VK_PASSTHRU_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
+# Device capture identifies 4f41 as the title background producer: its UNORM storage view covers a native SRGB image. The host converts a synchronized NV12 snapshot,
+# scales in UNORM, and copies the encoded bytes into that image. Confirmed animated title background on Odin3; later cutscene outputs remain unverified.
+# Only the observed final producer is filled; this key must also be in DM_VK_PASSTHRU_CS.
+env	DM_VK_MOVIE_FILL_CS=4f41ccf24f163e0d
+# The game's upscaler network (compute fa3033d05c0a41d6, 1440x810 to 1920x1080) is replaced by the host's bilinear scale and signed square, as on the other
+# profiles that name theirs (run on the Odin 3 since 2026-11-09). No neural residual or sharpening.
+env	DM_VK_UPSCALER_CS=fa3033d05c0a41d6
+env	DM_VK_UPSCALER_SQUARE_CS=fa3033d05c0a41d6
+# The image budget. Kokiri Forest holds about 2.96 GB of images on the Odin 3 (5,500 packaged textures, 1.9 GB) once render targets the game has reused are
+# dropped (gfx_vk_tex.c rt_stale), so the budget sits above that and no sweep runs there (2026-11-10: 0 sweeps, the process alive).
+env	DM_VK_IMAGE_BUDGET_MB=3072
+# The pool-texture prefetch (gfx_vk_exec.c pool_prefetch): the world's first frame gave about 2,200 registered textures their first use at once, one frame of 2.7 to 3.0 s
+# and the SoC at 102 °C (Odin 3, 2026-11-10). They are registered 3 s after the start and wait through the title and file select: with this their first uses are made there
+env	DM_VK_POOL_PREFETCH=1
+# The two-stage replay (gfx_vk_dq.c, DM_VK_MT_REPLAY=2): the recorder thread also ends and submits the command buffers and writes the descriptor sets. Kokiri on the Odin 3
+# (2026-11-12, same walk): the replay thread 18-26 ms of CPU a frame without it, 9.5-11.8 ms with it (the recorder 11-14 ms beside it), GPU time and picture unchanged, no command
+# buffer refused. The game is held by the GPU there (31-38 ms), so the frame rate does not move yet; it keeps the replay under 25 ms (40 fps) once the GPU is
+env	DM_VK_MT_REPLAY=2
