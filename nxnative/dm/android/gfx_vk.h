@@ -35,9 +35,12 @@ void vk_device_lost(VkResult r, const char *where);   // once: what the first un
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) X(vkCmdResolveImage) \
     X(vkCreateRenderPass) X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) \
+    X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) \
+    X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetDepthBiasEnable) X(vkCmdSetVertexInputEXT) X(vkCmdSetPolygonModeEXT) \
+    X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetRasterizationSamplesEXT) X(vkCmdSetAlphaToCoverageEnableEXT) X(vkCmdSetDepthClipNegativeOneToOneEXT) \
     X(vkCmdSetDepthBias) X(vkCmdSetLineWidth) X(vkCmdDraw) X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateComputePipelines) X(vkCreatePipelineCache) \
-    X(vkGetPipelineCacheData) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
+    X(vkGetPipelineCacheData) X(vkDestroyPipelineCache) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetAndroidHardwareBufferPropertiesANDROID) X(vkGetBufferDeviceAddress) \
     X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
@@ -52,7 +55,7 @@ typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkPipelineCache pcache;
-    int has_bc, has_astc, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_timeline, has_draw_count;   // has_draw_count: drawIndirectCount (multi-draws by the GPU's count)
+    int has_gpl, has_gpl_dyn, has_bc, has_astc, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_timeline, has_draw_count;   // has_draw_count: drawIndirectCount (multi-draws by the GPU's count)
     int has_filter_cubic; // EXT filter_cubic enabled; each blit still checks the source format capability
     int has_occ_precise;  // exact samples-passed query counts (used as a ratio by Bananza, not only a visibility Boolean)
     int has_barycentric;   // VK_KHR_fragment_shader_barycentric: per-vertex fragment inputs (Ampere LDTRAM)
@@ -241,6 +244,7 @@ typedef struct {
     // a primitive's vertices, the most vertices and primitives a workgroup, and the words a vertex has in the emulation's vertex buffer (gfx_vk_exec.c mesh_draw)
     int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
     int wmem;                           // gfx_vk_exec.c shader_wmem: 1 it writes memory (stores to storage buffers or images, atomics), 2 not, 0 not known yet
+    int used;                           // returned to the replay (not only to the warm pass, gfx_vk_exec.c gpl_warm): kept for good
     uint32_t mark_var;                  // DM_VK_POOL_MARK: the pool read marks' buffer variable (gfx_vk_shader.c spv_pool_mark), 0 none; its stores are not the game's memory writes (shader_wmem)
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader

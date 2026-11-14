@@ -524,7 +524,26 @@ static int storage_dynamic_binding(const dmsv_bind *b, uint32_t used, uint32_t l
     return used < limit && b->desc == RD_SSBO && b->count == 1 && (b->kind == RK_GS_CLAIM || (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16));
 }
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet);
+static __thread int t_warm;   // vk_shader_q for the warm pass (vk_shader_warm_get): the shader is not marked used
 vkshader_t *vk_shader(uint64_t key, int stage) { return vk_shader_q(key, stage, 0); }
+// The bundle's entries, for the warm pass (gfx_vk_exec.c gpl_warm): their keys and NVN stages
+uint32_t vk_bundle_n(void) { bundle_auto(); return g_bundle ? g_nent : 0; }
+int vk_bundle_at(uint32_t i, uint64_t *key, int *stage) { if (!g_bundle || i >= g_nent) return 0; memcpy(key, &g_ent[i].key, 8); *stage = (int)g_ent[i].stage; return 1; }
+// A shader for the warm pass: loaded as the replay loads it (the same SPIR-V, layout and module), without marking it used; *had: it was loaded before
+vkshader_t *vk_shader_warm_get(uint64_t key, int stage, int *had) {
+    bundle_auto(); struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
+    pthread_mutex_lock(&g_sh_mu); vkshader_t *s = nvn_hm_get(&g_shaders, &hk); pthread_mutex_unlock(&g_sh_mu);
+    *had = s != NULL; t_warm = 1; s = vk_shader_q(key, stage, 1); t_warm = 0; return s;
+}
+// ... and gone again when nothing else took it meanwhile (its layout stays: layouts are shared by their bindings, shader_layout)
+void vk_shader_warm_drop(vkshader_t *s) {
+    struct { uint64_t key; uint64_t stage; } hk = {s->key, (uint64_t)s->stage};
+    pthread_mutex_lock(&g_sh_mu);
+    if (s->used || s->nvar || nvn_hm_get(&g_shaders, &hk) != s) { pthread_mutex_unlock(&g_sh_mu); return; }
+    nvn_hm_del(&g_shaders, &hk); pthread_mutex_unlock(&g_sh_mu);
+    if (s->mod) vkDestroyShaderModule(V.dev, s->mod, NULL);
+    free(s->spv); if (s->gs_claim_invocations) free((void *)s->b); free(s);
+}
 // A geometry shader's input primitive is fixed when it is translated, and Maxwell's shader header doesn't give it: shader_vk.py translates each geometry shader for
 // triangles under its own key and for the other four kinds under derived keys. Read as triangles, the points Xenoblade Chronicles 3's particle updates draw were taken
 // three at a time (Vulkan leaves a mismatch undefined), and the particles' records came out wrong: no husk particles, send-off particles or item orbs
@@ -566,7 +585,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
     pthread_mutex_lock(&g_sh_mu);
     vkshader_t *s = nvn_hm_get(&g_shaders, &hk);
-    if (s) { pthread_mutex_unlock(&g_sh_mu); return s == (void *)1 ? NULL : s; }
+    if (s) { if (s != (void *)1 && !t_warm) s->used = 1; pthread_mutex_unlock(&g_sh_mu); return s == (void *)1 ? NULL : s; }
     const bent *e = g_bundle ? find(key) : NULL;
     if (!e) { nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu);
               static int n; if (!quiet && n++ < 16) VKLOG("[RED] shader %016llx (stage %d) is not in the bundle", (unsigned long long)key, stage); return NULL; }
@@ -737,7 +756,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     // The game's constant buffers and the driver segment are dynamic uniform buffers: their offset is given when the set is bound, so a set matches any draw's
     // with the same buffers (Unity updates a constant buffer before nearly every draw, and each update is a shadow at a new offset: NEO made a new set for
     // 94% of its draws, 5 ms a frame). Up to half the device's limit per stage, as the vertex and fragment sets share a pipeline layout. DM_VK_DYN_UBO=0: none.
-    static int dyn_on = -1; if (dyn_on < 0) { const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && !atoi(e)); }
+    static int dyn_on = -1; if (dyn_on < 0) { int vk_gpl_on(void); const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && !atoi(e)) && !vk_gpl_on(); }   // (not under pipeline libraries: with independent sets, the dynamic offsets of a part that names only its own set went to the wrong buffers on Turnip, Mario Odyssey's title screen 2026-11-14)
     uint32_t dynmax = dyn_on ? V.props.limits.maxDescriptorSetUniformBuffersDynamic / 2 : 0;
     uint32_t sdmax = storage_dynamic_limit(stage, V.dyn_ssbo, &V.props.limits), nubo = 0, nsbuf = 0;
     if (V.dyn_ssbo) { static int noted; if (!noted++) VKLOG("dynamic storage descriptors enabled (DM_VK_DYN_SSBO, startup): max %u per graphics stage, alignment %llu; buffers and ranges unchanged",
@@ -751,7 +770,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         VkDescriptorType dt = ds ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : du ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : desc_type(b->desc);
         lb[nl++] = (VkDescriptorSetLayoutBinding){b->binding, dt, b->count ? b->count : 32, stage_flag(stage), NULL};
     }
-    s->dsl = shader_layout(lb, nl);
+    s->dsl = shader_layout(lb, nl); s->used = !t_warm;
     nvn_hm_put(&g_shaders, &hk, s);
     pthread_mutex_unlock(&g_sh_mu);
     return s;
@@ -1330,6 +1349,17 @@ void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize 
     *buf = s->c1_buf; *off = 0; *len = (s->c1_len + 255) & ~255u;
 }
 // pipeline layouts by the set layouts of their stages (an empty layout fills the sets of absent stages)
+// A pipeline library part's layout: only its own stages' sets, the others absent (VK_NULL_HANDLE, allowed with independent sets), so one part serves every partner
+VkPipelineLayout vk_pipeline_layout_part(VkDescriptorSetLayout sets[VK_NSETS], int nsets) {
+    static nvn_hmap cache = {.klen = VK_NSETS * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    VkDescriptorSetLayout k[VK_NSETS]; for (int i = 0; i < VK_NSETS; i++) k[i] = i < nsets ? sets[i] : VK_NULL_HANDLE;
+    pthread_mutex_lock(&mu);
+    VkPipelineLayout pl = nvn_hm_get(&cache, k);
+    if (!pl) { VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, (uint32_t)nsets, k};
+               VKCHK(vkCreatePipelineLayout(V.dev, &ci, NULL, &pl)); nvn_hm_put(&cache, k, pl); }
+    pthread_mutex_unlock(&mu);
+    return pl;
+}
 VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int nsets) {
     static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = VK_NSETS * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
@@ -1337,7 +1367,8 @@ VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int ns
     VkDescriptorSetLayout k[VK_NSETS]; for (int i = 0; i < VK_NSETS; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
     VkPipelineLayout pl = nvn_hm_get(&cache, k);
     if (!pl) {
-        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nsets, k};
+        int vk_gpl_on(void);   // (gfx_vk_exec.c: parts and the pipelines linked from them take layouts with independent sets)
+        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, vk_gpl_on() ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0, (uint32_t)nsets, k};
         VKCHK(vkCreatePipelineLayout(V.dev, &ci, NULL, &pl)); nvn_hm_put(&cache, k, pl);
     }
     pthread_mutex_unlock(&mu);
