@@ -22,7 +22,8 @@ def ui_font_assets():   # {name under assets/: file}: the overlay's font and its
     return {'font/ui.bin': UI_FONT, **{f'font/{f.relative_to(d).as_posix()}': f for f in sorted(p for p in d.rglob('*.txt'))}}
 # The letters of the button-icon font (make_ext_font.py knocks them out of the icons): a bold system font of the machine that ports, never shipped in the repository
 LETTER_FONTS = [f'{os.environ.get("WINDIR", "C:/Windows")}/Fonts/{f}' for f in ('ARLRDBD.TTF', 'arialbd.ttf')] + [
-    '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf']
+    '/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+    '/usr/share/fonts/liberation/LiberationSans-Bold.ttf', '/usr/share/fonts/noto/NotoSans-Bold.ttf']   # after DejaVu: a machine that has both keeps the font (and its cache key) it had
 
 
 @dataclass
@@ -831,7 +832,7 @@ class Port:
         icon = self.icon()
         code = version_code(self.pkg_ver, self.o.vercode_offset)
         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
-        external = self.external_activity() if self.o.external_display or self.o.native_keyboard else []
+        external = self.external_activity() if self.o.external_display or self.o.native_keyboard else self.keep_alive_only()
         driver = self.o.vulkan_driver
         if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
             driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
@@ -843,6 +844,13 @@ class Port:
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
+
+    def keep_alive_only(self):
+        """A code-less APK gets the keep-alive service (java/org/nx2a/KeepAlive.java: a game left with HOME stays in memory) when javac and an Android SDK are there;
+        without them the APK stays code-less, as before, and Android may end the game in the background"""
+        try: return self.external_activity()[:2] + ['--keep-alive']
+        except BuildError:
+            say('no javac or Android SDK (ANDROID_HOME): the APK has no keep-alive service, and Android may end the game while it is in the background'); return []
 
     def external_activity(self):
         javac = shutil.which('javac')
@@ -859,7 +867,8 @@ class Port:
         nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
         nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=self.env)
         activity = 'KeyboardExternalActivity' if self.o.native_keyboard else 'ExternalActivity'
-        return ['--dex', dex / 'classes.dex', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
+        if not (self.o.external_display or self.o.native_keyboard): return ['--dex', dex / 'classes.dex']
+        return ['--dex', dex / 'classes.dex', '--keep-alive', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
 
     def theme(self):
         """The on-screen gamepad's theme: only the game's own pack goes in the APK (dm/android/themes/themes.tsv maps title IDs to packs; a game with no row
@@ -909,6 +918,10 @@ class Port:
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         env = self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else []) + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else [])
         files = {**self.fps_files, **font_files}
+        # The starter pipeline list (gfx_vk_exec.c prewarm_start): a vk_pipelines.bin recorded in play, kept in the game's profile as vk_pipelines.seed.bin. On the
+        # device its entries the player's own list lacks are added to it, so a new install (or an emptied list) prewarms the effects earlier play met
+        seed = self.ap.path.parent / 'vk_pipelines.seed.bin'
+        if seed.is_file(): files['vk_pipelines.seed.bin'] = seed
         # Reuse: the pack is 186,000 hard links for a Switch 2 game (Ocarina of Time: 2:45 on an idle disk, 11 min beside another reader), made again on every run though an
         # app-only rebuild changes none of it. Its inputs are the stages' own keys (the rewrite's and the shader bundle's key files, the RomFS image's stamp), the profile, the
         # DLC / system data trees and the rows written into it; with the same key and the pack's manifest in place, the pack stands

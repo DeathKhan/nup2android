@@ -514,7 +514,10 @@ static void rc_note(uint64_t a, int kind) {
     if (kind == 2) rc_occ_add(a);
     uint64_t f = mtl_last_fence() + 1;   // the submission being replayed (as OP_FENCE_SYNC)
     for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; g_rc_pend[i].fence = f; return; }
+    if (kind == 2) return;   // (g_rc_occ holds it. Appended here too, a frame's occlusion reports filled the table and a timestamp report after them was not noted: Ocarina of
+                             // Time clears its 768x432 refraction target under such a condition at each bind, reports once, and the later clears wiped the scene copy: opaque water)
     if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend].fence = f; g_rc_pend[g_rc_npend++].kind = kind; }
+    else { static int said; if (!said) { said = 1; VKLOG("render conditions: more than %d timestamp reports pending, the rest are unknown until they land", RC_PEND); } }
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay time
     uint64_t done = vk_reports_fence_done(), of = rc_occ_fence(a);
@@ -526,6 +529,9 @@ static void render_cond(const p_render_cond *rc) {
     if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; return; }
     uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
     g_rc_skip = known && (rc->mode ? x == y : x != y);
+    if (g_x_tracepass == -2) { int k0 = -1, k1 = -1; uint64_t f0 = 0, f1 = 0; for (int i = 0; i < g_rc_npend; i++) { if (g_rc_pend[i].addr == rc->addr) { k0 = g_rc_pend[i].kind; f0 = g_rc_pend[i].fence; } if (g_rc_pend[i].addr == rc->addr + 16) { k1 = g_rc_pend[i].kind; f1 = g_rc_pend[i].fence; } }
+        VKLOG("--- render condition mode %d at %#llx: %s (%s), memory %llu / %llu, reports done to %llu, occlusion fence %llu / %llu, pending kind %d fence %llu / kind %d fence %llu", rc->mode, (unsigned long long)rc->addr, g_rc_skip ? "skip" : "draw", known ? "known" : "unknown",
+            (unsigned long long)*(const volatile uint64_t *)(uintptr_t)rc->addr, (unsigned long long)*(const volatile uint64_t *)(uintptr_t)(rc->addr + 16), (unsigned long long)vk_reports_fence_done(), (unsigned long long)rc_occ_fence(rc->addr), (unsigned long long)rc_occ_fence(rc->addr + 16), k0, (unsigned long long)f0, k1, (unsigned long long)f1); }
 }
 
 void vk_exec_reset(void) {   // a new submission: NVN state does not carry over between command buffers, the replay starts from the defaults
@@ -731,7 +737,8 @@ static int pass_commit(void) {
     if (g_x_tracesize[0] && g_x_tracepass < 0) {   // DM_VK_TRACE_SIZE=WxH[:format[:format]] (live): trace the next pass whose first colour target is that (passes are numbered anew each frame)
         char b[48]; snprintf(b, sizeof b, "%ux%u:%d:%d", S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1]);
         const char *h = strchr(g_x_tracesize, '#'); size_t l = h ? (size_t)(h - g_x_tracesize) : strlen(g_x_tracesize);   // #n: the (n+1)th such pass
-        if (!strncmp(b, g_x_tracesize, l)) { if (h && atoi(h + 1) > 0) { snprintf(g_x_tracesize + l, sizeof g_x_tracesize - l, "#%d", atoi(h + 1) - 1); setenv("DM_VK_TRACE_SIZE", g_x_tracesize, 1); }
+        const char *at = strchr(g_x_tracesize, '@'); if (at && (size_t)(at - g_x_tracesize) < l) l = (size_t)(at - g_x_tracesize);   // @p: only the submission's pass p (WxH@p)
+        if (!strncmp(b, g_x_tracesize, l) && (!at || atoi(at + 1) == g_sub_pass - 1)) { if (h && atoi(h + 1) > 0) { snprintf(g_x_tracesize + l, sizeof g_x_tracesize - l, "#%d", atoi(h + 1) - 1); setenv("DM_VK_TRACE_SIZE", g_x_tracesize, 1); }
             else { g_x_tracepass = g_sub_pass - 1; g_x_tracesize[0] = 0; setenv("DM_VK_TRACE_SIZE", "", 1); } } }
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) VKLOG("=== traced pass %d: %ux%u, colour formats %d %d, depth format %d", g_x_tracepass, S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1], S.dfmt); g_pass_draws = 0; g_pass_bb[0] = g_pass_bb[1] = INT32_MAX; g_pass_bb[2] = g_pass_bb[3] = INT32_MIN;
     return 1;
@@ -1252,18 +1259,20 @@ static void lin_back(void) {
         { static int n; if (n++ < 4) VKLOG("linear render target %ux%u (nvn format %#x, stride %zu) copied back to its storage %p", im->w, im->h, t->d.format, stride, (void *)t->mem); }
     }
 }
+static struct { vkimg_t *dst; int slot; uint32_t lv, n, ly[8], w, h; } P_sm;   // a pass drawn into a scratch target (self_mrt_scratch, below)
+static void self_mrt_copy(VkCommandBuffer cb, int back);
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { extern uint32_t g_vk_pass_flags; g_vk_pass_flags = (uint32_t)(S.ncol & 15) | (S.daspect ? 16u : 0) | (S.daspect && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 32u : 0) | (S.ncol && P_ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 64u : 0) | (P_split ? 128u : 0); }
-    if (S.pass_open == 1) { pass_journal_pass("end"); vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) { pass_journal_pass("end"); vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); if (P_sm.dst) self_mrt_copy(vk_cmd(), 1); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
-    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0; P_sm.dst = NULL;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
-void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) vk_ubd_land(vk_cmd()); }
+void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) { VkCommandBuffer vk_cmd_peek(void); vk_ubd_land(vk_cmd_peek()); } }   // (vk_ubd_land has a barrier of its own on either side: a run of dispatches stays open, gfx_vk_core.c vk_cmd)
 static int pass_whole(VkRect2D r) { return !r.offset.x && !r.offset.y && r.extent.width >= S.pass_w && r.extent.height >= S.pass_h; }
 // Only a native command-buffer boundary advances the depth/LRZ cut generation.
 // A refused ordinary budget or exhausted slot must retain the current draw count.
@@ -1342,6 +1351,48 @@ fail:
     if (im.img) vkDestroyImage(V.dev, im.img, NULL);
     if (im.mem) vkFreeMemory(V.dev, im.mem, NULL);
     return 0;
+}
+
+// Several colour targets that are layers of one mip level of one image (DM_VK_SELF_MRT, default on; 0 at start-up: off). Ocarina of Time builds the mip levels
+// of its two 128x128 reflection cubes (B10G11R11) that way: for each level a pass with six targets, the six faces of that level, whose fragment shader samples the same
+// cube one level up. On the Adreno 830 (Qualcomm's driver 0x80320048) a pass whose targets are layers of one image puts its outputs into the wrong layers: with a fragment
+// shader that writes one constant colour per output, face 1 got output 2's colour, face 2 output 0's, faces 4 and 5 output 0's too, with stray 8-pixel blocks of the
+// others (uniforms, views, sampler and barriers all checked right; so drawing into layers of one scratch image, tried first, was no better). The levels past the first came out
+// flat or nearly black, and the water of Kokiri Forest, which reads the rougher levels more the steeper the camera looks down, went black as the camera was raised. Such a
+// pass draws into one scratch image per target instead (the level's contents copied in first: the pass loads), and its end copies each into its face of the level
+#define SM_N 32
+static struct { vkimg_t im[8]; VkImageView v[8]; } g_sm[SM_N]; static int g_sm_n, g_sm_failed;
+static int self_mrt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SELF_MRT"); on = e && *e ? atoi(e) : 1; } return on; }
+static int self_mrt_scratch(VkFormat fmt, uint32_t w, uint32_t h) {   // the scratch image's slot; -1: none could be made (the pass draws into the image itself)
+    for (int i = 0; i < g_sm_n; i++) if (g_sm[i].im[0].fmt == fmt && g_sm[i].im[0].w == w && g_sm[i].im[0].h == h) return i;
+    if (g_sm_failed || g_sm_n >= SM_N) return -1;
+    vkimg_t im[8]; VkImageView v[8] = {0}; memset(im, 0, sizeof im);
+    for (uint32_t l = 0; l < 8; l++) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, fmt, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vkCreateImage(V.dev, &ci, NULL, &im[l].img)) goto fail;
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(V.dev, im[l].img, &mr);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+        vk_mem_tag = "self-mrt-scratch"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &im[l].mem); vk_mem_tag = NULL;
+        if (r || vkBindImageMemory(V.dev, im[l].img, im[l].mem, 0)) goto fail;
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im[l].img, VK_IMAGE_VIEW_TYPE_2D, fmt, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(V.dev, &vi, NULL, &v[l])) goto fail;
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im[l].img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(vk_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        im[l].w = w; im[l].h = h; im[l].fmt = fmt; im[l].usage = ci.usage; im[l].aspect = VK_IMAGE_ASPECT_COLOR_BIT; im[l].d = im[l].levels = im[l].samples = im[l].layers = 1; im[l].vtype = VK_IMAGE_VIEW_TYPE_2D; im[l].layout = VK_IMAGE_LAYOUT_GENERAL; }
+    VKLOG("colour targets in one mip level of one image: scratch targets %ux%u format %d (DM_VK_SELF_MRT)", w, h, (int)fmt);
+    memcpy(g_sm[g_sm_n].im, im, sizeof im); memcpy(g_sm[g_sm_n].v, v, sizeof v); return g_sm_n++;
+fail:
+    VKLOG("[RED] colour targets in one mip level of one image: no scratch target %ux%u format %d could be made: such passes draw into the image itself from here", w, h, (int)fmt); g_sm_failed = 1; return -1;
+}
+static void self_mrt_copy(VkCommandBuffer cb, int back) {   // the level's layers into the scratch images (before the pass) or back (after it)
+    vkimg_t *sc = g_sm[P_sm.slot].im;
+    vk_img_barrier_all(cb);
+    for (uint32_t i = 0; i < P_sm.n; i++) { VkImageSubresourceLayers a = {VK_IMAGE_ASPECT_COLOR_BIT, P_sm.lv, P_sm.ly[i], 1}, b = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        VkImageCopy r = {back ? b : a, {0, 0, 0}, back ? a : b, {0, 0, 0}, {P_sm.w, P_sm.h, 1}};
+        vkCmdCopyImage(cb, back ? sc[i].img : P_sm.dst->img, VK_IMAGE_LAYOUT_GENERAL, back ? P_sm.dst->img : sc[i].img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); }
+    vk_img_barrier_all(cb);
 }
 static int begin_pass(void) {
     if (S.pass_open) return 1;
@@ -1434,6 +1485,17 @@ static int begin_pass(void) {
       if (da.imageView) { cs[8] = dim->samples; if (cs[8] > 1) any = 1; if (s0 && cs[8] != s0) mis = 1; }
       if ((any || mis) && n < 10) { n++; VKLOG("pass %ux%u samples: colour %u %u %u %u, depth %u%s", w, h, cs[0], cs[1], cs[2], cs[3], cs[8], mis ? " MISMATCH" : ""); } }
     if (!g_x_nobar) vk_img_barrier_all(cb);
+    P_sm.dst = NULL;
+    if (ncol > 1 && ncol <= 8 && samples == 1 && layers == 1 && !da.imageView && self_mrt_on()) {   // (self_mrt_scratch)
+        vkimg_t *one = P_att[0].im; uint32_t lv0 = 0; int ok = one && one->aspect == VK_IMAGE_ASPECT_COLOR_BIT && one->samples == 1;
+        for (int i = 0; ok && i < ncol; i++) { uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0; if (!i) lv0 = lv;
+            ok = ca[i].imageView && P_att[i].im == one && lv == lv0 && P_att[i].fmt == (uint32_t)one->fmt && P_att[i].w == w && P_att[i].h == h && S.rt_has_cview[i] && S.rt_cview[i].set_layers && S.rt_cview[i].min_layer < one->layers; }
+        int slot = ok ? self_mrt_scratch(one->fmt, w, h) : -1;
+        if (slot >= 0) { cb = vk_cmd(); P_sm.dst = one; P_sm.slot = slot; P_sm.lv = lv0; P_sm.n = (uint32_t)ncol; P_sm.w = w; P_sm.h = h;
+            for (int i = 0; i < ncol; i++) { P_sm.ly[i] = S.rt_cview[i].min_layer; ca[i].imageView = g_sm[slot].v[i]; P_att[i].im = &g_sm[slot].im[i]; }
+            self_mrt_copy(cb, 0);
+            static int n; if (n++ < 4) VKLOG("pass %ux%u with %d colour targets in level %u of one image: drawn into a scratch target and copied back (DM_VK_SELF_MRT)", w, h, ncol, lv0); }
+    }
     if (cut_touch) lrz_touch(dim, (g_lrz_touch & LRZ_CUT) != 0);   // (after the barrier: the earlier command buffer's depth writes come first)
     if (g_x_depth) { da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; }
     if (g_x_color) for (int i = 0; i < ncol; i++) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -1759,6 +1821,8 @@ static void clear_color(const p_clear_color *c) {
     // kept what earlier frames added, and the pass of fog boxes that reads them (vertex shader 1300ca45ddca3566) came out different every frame on its first road
     // (pass dumps over 4 frames, centre of the road: 29.6, 40.7, 31.7, 39.7; with every layer cleared 30.4 in each, the passes before it the same either way)
     VkClearRect r = {scissor_rect(), 0, P_ri.layerCount ? P_ri.layerCount : 1};
+    if (g_x_tracepass == -2) VKLOG("--- colour clear: slot %d mask %#x to %g %g %g %g, %ux%u at %d,%d, in pass %d%s", c->index, (unsigned)c->mask, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3],
+        r.rect.extent.width, r.rect.extent.height, r.rect.offset.x, r.rect.offset.y, g_sub_pass - 1 + (S.pass_open == 2), S.pass_open == 2 ? " (before its first draw)" : "");
     if (S.pass_open == 2 && (c->mask & 0xf) == 0xf && pass_whole(r.rect)) {   // the whole attachment before any draw: its load op
         P_ca[c->index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; P_ca[c->index].clearValue.color = a.clearValue.color; P_cleared = 1; g_vkst.folded++; return;
     }
@@ -1896,18 +1960,42 @@ static pkey g_last_k; static VkPipeline g_last_p;
 enum { APQ = 256 };
 static pkey g_apq[APQ]; static int g_apq_h, g_apq_t, g_apq_on;   // queued keys (a draw left out counts as skipped for no pipeline)
 static pthread_mutex_t g_apq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_apq_cv = PTHREAD_COND_INITIALIZER;
+// Batch prediction (predict_rest): keys queued ahead of their draws. They are recorded for the prewarm only when a draw takes them (graphics_pipeline,
+// pred_taken), so a mispredicted key never enters vk_pipelines.bin. Under g_pipe_mu
+static nvn_hmap g_pred = {.klen = sizeof(pkey)};
+static uint64_t g_pred_hit;
+static int pred_pending(const pkey *k) { return g_pred.n && nvn_hm_get(&g_pred, k); }   // under g_pipe_mu
+static void pred_taken(const pkey *k, VkPipeline p) {   // under g_pipe_mu: a draw took k
+    if (!pred_pending(k)) return;
+    nvn_hm_del(&g_pred, k); g_pred_hit++; if (p && p != (void *)1 && p != PIPE_PENDING) pipe_record(k);
+}
 static void async_pipe_complete(const pkey *k, VkPipeline p) {
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);   // a prewarm thread made it meanwhile (as graphics_pipeline does: the one in the table may be bound already, the new one goes)
     if (had && had != PIPE_PENDING) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); }
-    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
+    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1 && !pred_pending(k)) pipe_record(k); }
     pthread_cond_broadcast(&g_pipe_ready); pthread_mutex_unlock(&g_pipe_mu);   // wake counted draws waiting on either success or failure
 }
+static void apq_build(const pkey *kp);
 static void *async_pipe_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk async pipe");
     for (;;) {
         pthread_mutex_lock(&g_apq_mu); while (g_apq_h == g_apq_t) pthread_cond_wait(&g_apq_cv, &g_apq_mu);
         pkey k = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
+        apq_build(&k);
+    }
+    return NULL;
+}
+// Priority: the prewarm threads take queued keys (pipelines play is waiting for or will draw next) before each recorded entry of their own, so a draw's pipeline
+// never waits behind the start-up list. 1: one built
+static int apq_help(void) {
+    pkey k; pthread_mutex_lock(&g_apq_mu);
+    if (g_apq_h == g_apq_t) { pthread_mutex_unlock(&g_apq_mu); return 0; }
+    k = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
+    apq_build(&k); return 1;
+}
+static void apq_build(const pkey *kp) {
+    {   pkey k = *kp;
         vkshader_t *stg[3] = {0}; VkPipeline p = (VkPipeline)1;
         for (int s = 0; s < 3; s++) if (k.key[s] && !(s == 1 && k.raster_discard)) stg[s] = vk_shader(k.key[s], s);
         if (stg[0]) { VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
@@ -1916,7 +2004,6 @@ static void *async_pipe_thread(void *arg) {
             { static int n; if (n++ < 6) VKLOG("pipeline built in the background in %.1f ms (shaders %016llx %016llx)", (tick() - t0) / 1e6, (unsigned long long)k.key[0], (unsigned long long)k.key[1]); } }
         async_pipe_complete(&k, p);
     }
-    return NULL;
 }
 static int shader_wmem(vkshader_t *s);
 // The packed reflection does not reliably mark every write (images have no rw bit, and Bananza's shipped culling GS has an unmarked storage buffer), and a storage
@@ -1967,11 +2054,23 @@ static int pipe_must_draw(const pkey *k) {   // 1: the draw cannot be left out w
     if (!natt) return 1;
     return 0;
 }
+// The background threads: 2 at the first queued key; while the queue is deeper than the threads running (a batch, predict_rest: an area load queues dozens),
+// more up to DM_VK_ASYNC_THREADS (default 4 with 8 cores or more, else 2). The extra ones stay, waiting on the queue, once made
+static int apq_threads_max(void) {
+    static int mx; if (!mx) { const char *e = getenv("DM_VK_ASYNC_THREADS"); long nc = sysconf(_SC_NPROCESSORS_ONLN); mx = e && atoi(e) > 0 ? atoi(e) : nc >= 8 ? 4 : 2; if (mx > 8) mx = 8; }
+    return mx;
+}
+static void apq_spawn(int want) {   // under g_apq_mu
+    static int failed; if (failed) return;
+    for (int tries = want - g_apq_on; tries > 0 && g_apq_on < want; tries--) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        int r = pthread_create(&t, &a, async_pipe_thread, NULL); pthread_attr_destroy(&a);
+        if (r) { if (g_apq_on >= 2) failed = 1; continue; }   // (none at all: tried again at the next key, and a queued key without a worker is built synchronously)
+        g_apq_on++; }
+}
 static int apq_push(const pkey *k) {   // 1: queued for the background threads, pending in the table; under nothing (takes g_pipe_mu)
     pthread_mutex_lock(&g_apq_mu);
-    if (!g_apq_on) { for (int i = 0; i < 2; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            if (!pthread_create(&t, &a, async_pipe_thread, NULL)) { g_apq_on++; }
-            pthread_attr_destroy(&a); } }
+    if (!g_apq_on) apq_spawn(2 < apq_threads_max() ? 2 : apq_threads_max());
+    else if (g_apq_on >= 2 && g_apq_on < apq_threads_max() && (int)(g_apq_h - g_apq_t) >= g_apq_on) apq_spawn(g_apq_on + 1);   // deep: one more (after the first two)
     int ok = g_apq_on && g_apq_h - g_apq_t < APQ;   // no worker: build synchronously, never leave an unfulfillable pending entry
     if (ok) { g_apq[g_apq_h % APQ] = *k; g_apq_h++; pthread_cond_signal(&g_apq_cv); }
     pthread_mutex_unlock(&g_apq_mu);
@@ -1994,23 +2093,32 @@ static void pipe_sibling(const pkey *k) {
 static uint64_t g_sync_pipes, g_sync_pipe_ns;
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipes, __ATOMIC_RELAXED); }
 void mtl_create_ns(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipe_ns, __ATOMIC_RELAXED); }
+static int g_replay_waits;   // the replay thread is building a pipeline or waiting for one (priority: prewarm_thread yields)
+static void predict_rest(const pkey *cur);
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (g_last_p && !memcmp(k, &g_last_k, sizeof *k)) return g_last_p == (void *)1 ? VK_NULL_HANDLE : g_last_p;
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k);
     // This key may have been queued by a draw that could be left out, or as a sibling (pipe_sibling). Wait for that build rather than dropping a draw that cannot be.
-    while (p == PIPE_PENDING && pipe_must_draw(k)) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
+    if (p == PIPE_PENDING && pipe_must_draw(k)) {
+        __atomic_add_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);
+        while (p == PIPE_PENDING && pipe_must_draw(k)) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
+        __atomic_sub_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED); }
+    if (p && p != PIPE_PENDING) pred_taken(k, p);
     pthread_mutex_unlock(&g_pipe_mu);
+    if (!p) predict_rest(k);   // the first miss of this submission: the rest of its draws' missing pipelines go to the background threads (batch)
     if (p == PIPE_PENDING) return VK_NULL_HANDLE;
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
     pipe_sibling(k);
+    __atomic_add_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);   // (priority: the prewarm threads start no entry of their own meanwhile)
     uint64_t tb = tick(); p = build_pipeline(k, layout, stg); tb = tick() - tb; if (g_prof_on) g_prof_ns[0] += tb; g_vkst.pipes_built++;
+    __atomic_sub_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_sync_pipes, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_sync_pipe_ns, tb, __ATOMIC_RELAXED);
     if (tb > 50000000ull) VKLOG("pipeline built on the replay thread in %.0f ms (shaders %016llx %016llx %016llx; present %llu)", tb / 1e6, (unsigned long long)k->key[0], (unsigned long long)k->key[1], (unsigned long long)k->key[2], (unsigned long long)g_tex_frame);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
-    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
+    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; pred_taken(k, p); }   // a prewarm thread made it meanwhile
     else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
     pthread_mutex_unlock(&g_pipe_mu);
     return p == (void *)1 ? VK_NULL_HANDLE : p;
@@ -2044,7 +2152,7 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
     if (g_precq_n < PREC_Q) g_precq[g_precq_n++] = *k;   // (a full queue drops the record: that pipeline is only not prewarmed next time)
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
-static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+static pkey *g_pw; static size_t g_pw_n, g_pw_lim; static volatile size_t g_pw_next, g_pw_done;   // g_pw_lim: the entries the threads make (DM_VK_PREWARM_MAX)
 // A recorded pipeline whose compile never finishes (droidplay-core feca0ebe5): the prewarm makes the list again at every start, so an entry the driver's compiler crashes
 // or hangs on would end every start a few seconds in, and vk_pipelines.bin sits where a player does not clear it. Each prewarm thread writes the entry it makes (from its
 // shader modules to the end of the driver's compile) into its own slot of a marker file (vk_pipelines.making) and clears the slot when the compile returns; a crash in that
@@ -2099,7 +2207,11 @@ static void *prewarm_thread(void *arg) {
     int slot = (int)(intptr_t)arg; pthread_setname_np(pthread_self(), "vk prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
     for (;;) {
-        size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
+        // Priority: queued keys first (draws waiting, or predicted for the rest of a submission); while the replay thread builds or waits for a pipeline with nothing
+        // queued, no entry of ours is started (up to 50 ms at a time), so its compile has the cores
+        while (apq_help()) {}
+        for (int w = 0; w < 50 && __atomic_load_n(&g_replay_waits, __ATOMIC_RELAXED) > 0; w++) { usleep(1000); if (apq_help()) w = 0; }
+        size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_lim) break;
         const pkey *k = &g_pw[i];
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         if (have) continue;
@@ -2123,7 +2235,7 @@ static void *prewarm_thread(void *arg) {
         if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL);
         pthread_mutex_unlock(&g_pipe_mu);
         size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
-        if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
+        if (d == g_pw_lim || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_lim);
     }
     return NULL;
 }
@@ -2141,6 +2253,25 @@ static void prewarm_start(void) {
         VKLOG("prewarm: %zu pipelines recorded before the alpha test key fields, read with the test off", g_pw_n);
     }
     if (f) fclose(f);
+    // The starter list: vk_pipelines.seed.bin, which the porter puts in the data pack from the game's profile (dm/games/<id>/vk_pipelines.seed.bin, recorded on a
+    // device in play). Its entries the recorded list lacks are added after it, at every start, so a new install, an emptied list or a key layout change still
+    // prewarms what earlier play met (the scenes and effects a first sight would otherwise build on the replay thread); the player's own records are kept as
+    // they are and first. A seed of another key layout is ignored. DM_VK_SEED=0 turns it off
+    { const char *e = getenv("DM_VK_SEED"); char sp[1024]; snprintf(sp, sizeof sp, "%s/vk_pipelines.seed.bin", root); FILE *sf = !(e && *e == '0') ? fopen(sp, "rb") : NULL;
+      uint32_t sh[2] = {0};
+      if (sf && fread(sh, sizeof sh, 1, sf) == 1 && sh[0] == hdr[0] && sh[1] == hdr[1]) {
+          fseek(sf, 0, SEEK_END); long sn = (ftell(sf) - (long)sizeof sh) / (long)sizeof(pkey); fseek(sf, sizeof sh, SEEK_SET);
+          if (sn > 0) {
+              // (the recorded list's own repeats go too: Kirby's 3416 records held 3140 keys, and each repeat took a place under DM_VK_PREWARM_MAX)
+              nvn_hmap have = {.klen = sizeof(pkey)}; size_t j = 0; for (size_t i = 0; i < g_pw_n; i++) if (!nvn_hm_get(&have, &g_pw[i])) { nvn_hm_put(&have, &g_pw[i], (void *)1); g_pw[j++] = g_pw[i]; }
+              if (j < g_pw_n) VKLOG("prewarm: %zu repeated records dropped", g_pw_n - j); g_pw_n = j;
+              pkey *m = realloc(g_pw, (g_pw_n + (size_t)sn) * sizeof(pkey)); size_t added = 0, read = 0;
+              if (m) { g_pw = m; pkey k; while (read < (size_t)sn && fread(&k, sizeof k, 1, sf) == 1) { read++; if (nvn_hm_get(&have, &k)) continue; nvn_hm_put(&have, &k, (void *)1); g_pw[g_pw_n++] = k; added++; } }
+              free(have.keys); free(have.vals);
+              VKLOG("prewarm: starter list %zu entries, %zu added to the %zu recorded", read, added, g_pw_n - added);
+          }
+      } else if (sf) VKLOG("[RED] prewarm: starter list %s has another key layout (%u, this build %u): ignored", sp, sh[1], hdr[1]);
+      if (sf) fclose(sf); }
     pwm_take();
     if (g_pw_skip.n) { size_t j = 0; for (size_t i = 0; i < g_pw_n; i++) if (!nvn_hm_get(&g_pw_skip, &g_pw[i])) g_pw[j++] = g_pw[i];
         if (j < g_pw_n) VKLOG("prewarm: %zu recorded pipelines left out (the skip list: an earlier start ended in their compile)", g_pw_n - j); g_pw_n = j; }
@@ -2148,7 +2279,10 @@ static void prewarm_start(void) {
     g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
     if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
     long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
-    VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
+    // At most the list's first DM_VK_PREWARM_MAX entries are made (default 3000, 0 = all; droidplay-core prewarm_thread's PREWARM_MAX): the list only grows, and
+    // making all of a long one kept the cores busy into play. The rest stay in the file, and the driver's pipeline cache still holds what they built before
+    { const char *e = getenv("DM_VK_PREWARM_MAX"); size_t mx = e ? (size_t)strtoul(e, NULL, 10) : 3000; g_pw_lim = mx && g_pw_n > mx ? mx : g_pw_n; }
+    VKLOG("prewarm: %zu recorded pipelines on %d threads%s", g_pw_lim, nt, g_pw_lim < g_pw_n ? " (the first of the list, DM_VK_PREWARM_MAX)" : "");
     pwm_open();
     for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, (void *)(intptr_t)i); pthread_attr_destroy(&a); }
 }
@@ -2852,6 +2986,10 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
     vk_pool_tag = "uniform"; vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
     if (!p) { *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; return; }
     buf = p->buf; off = u->addr - p->lo;
+    if (g_tracing && n >= 32) { float f[8]; vk_ubd_read(u->addr, 32, (uint8_t *)f);   // what this draw reads at the start of the buffer (with the deferred updates)
+        VKLOG("  stage %d register %d: uniform buffer 0x%llx size %llu starts %g %g %g %g  %g %g %g %g", st, b->reg, (unsigned long long)u->addr, (unsigned long long)n, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]); }
+    if (g_tracing && n >= 288) { float f[72]; vk_ubd_read(u->addr, 288, (uint8_t *)f);
+        for (int r = 0; r < 18; r++) VKLOG("    row %d: %g %g %g %g", r, f[r*4], f[r*4+1], f[r*4+2], f[r*4+3]); }
     if (off + n > p->hi - p->lo) {
         if (p->hi < p->end && u->addr + n <= p->end) {   // into the pool's next chunk (vk_cross): the whole range from CPU memory, one copy per submission
             static struct { uint64_t a, n, ep, gen; VkBuffer b; VkDeviceSize o; } cc[16]; unsigned k = (unsigned)(u->addr >> 8) % 16;
@@ -3029,7 +3167,9 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             bi[nw] = mb->b ? (VkDescriptorBufferInfo){mb->b, mb->off, mb->len} : (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; break; }
         case RK_SBUF: case RK_UBO_PTR: case RK_SBUF_UBO: sbuf_desc(st, b, &bi[nw]); break;
         case RK_TEX: case RK_TEX_UBO: case RK_TEX_C2A: {
-            int cnt = b->count ? b->count : 32; if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) cnt = 1;
+            int cnt = b->count ? b->count : 32;
+            // Twelve 32-entry arrays fill ii; even a scalar after them needs a capacity check, never a truncated write.
+            if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] image descriptor array exceeds capacity");
             for (int k = 0; k < cnt; k++) {
                 uint64_t h = b->kind == RK_TEX ? vk_tex_slot_handle(S.tex[st], S.img[st], (unsigned)b->reg) :
                              b->kind == RK_TEX_UBO ? mem_handle(ubo_word(st, b->reg, b->off + 8 * k)) : (b->off >= 0 ? c2_handle(st, b->off + 8 * k) : 0);
@@ -3042,7 +3182,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             continue; }
         case RK_TEXD: case RK_SAMPD: {
             int cnt = b->count ? b->count : 32;
-            if (cnt > 32 || nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("dynamic texture array exceeds capacity");
+            if (cnt > 32 || nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] dynamic texture array exceeds capacity");
             for (int k = 0; k < cnt; k++) {
                 VkDescriptorImageInfo *di = &ii[nii + k]; memset(di, 0, sizeof *di);
                 if (b->kind == RK_SAMPD) {
@@ -3069,6 +3209,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             nw++; continue;
         }
         case RK_IMG: case RK_IMG_UBO: {
+            if (nii >= sizeof ii / sizeof *ii) die("[RED] [vk] storage image descriptor exceeds capacity");
             uint64_t h = b->kind == RK_IMG ? (b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0) : mem_handle(ubo_word(st, b->reg, b->off));
             int num = tex_desc_for(st, b, h, &ii[nii], 1);
             if (i < 64) { if (num == 1) g_num_um |= 1ull << i; else if (num == 2) g_num_im |= 1ull << i; }   // image reads/stores preserve the registered view's integer words
@@ -3087,8 +3228,10 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
         default: {   // unknown: the descriptor type it was declared with, filled with what reads zero
             if (b->desc == RD_UBO || b->desc == RD_SSBO) bi[nw] = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536};
             else if (b->desc == RD_SAMPLED || b->desc == RD_STORAGE) {
+                int cnt = b->count ? b->count : 32;
+                if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] fallback image descriptor array exceeds capacity");
                 ii[nii] = (VkDescriptorImageInfo){b->desc == RD_SAMPLED ? vk_dummy_sampler() : VK_NULL_HANDLE, vk_dummy_view(b->dim == 0xff ? 1 : b->dim, b->flags & 1, (b->flags & 2) != 0, b->desc == RD_STORAGE, 0), VK_IMAGE_LAYOUT_GENERAL};
-                int cnt = b->count ? b->count : 32; for (int k = 1; k < cnt && nii + k < sizeof ii / sizeof *ii; k++) ii[nii + k] = ii[nii];
+                for (int k = 1; k < cnt; k++) ii[nii + k] = ii[nii];
                 wr->pImageInfo = &ii[nii]; nii += (uint32_t)cnt; wr->descriptorCount = (uint32_t)cnt;
                 wr->descriptorType = b->desc == RD_SAMPLED ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; nw++; continue;
             } else if (b->desc == RD_TBUF || b->desc == RD_STORAGE_TBUF) { bv[nw] = vk_dummy_tbuf(b->desc == RD_STORAGE_TBUF); wr->pTexelBufferView = &bv[nw];
@@ -3853,6 +3996,82 @@ static int order_feedback(int nst) {   // a stage of the draw samples one of the
     }
     return 0;
 }
+// The pipeline key of the draw about to be made from the replay state (S, the open pass): prepare_draw's, and predict_rest's for the draws after it
+// (predict: no side effects, no logging). The descriptor-dependent fields (um, im: integer-texel variants) are filled by prepare_draw from its sets
+static void pkey_fill(pkey *kp, int prim, int indexed, int var, int predict) {
+    memset(kp, 0, sizeof *kp);
+    for (int i = 0; i < 3; i++) kp->key[i] = S.sh[i] ? S.sh[i]->key : 0;
+    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (kp->key[0] == g_x_flat[i]) kp->flat = (uint32_t)g_x_flat_mode[i] & 127;
+    kp->topo = topo(prim); kp->restart = S.prim_restart && (kp->topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || kp->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || kp->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
+    kp->raster_discard = S.rast_discard; kp->alt = (uint32_t)(g_spv_alt && (!g_spv_key || kp->key[0] == g_spv_key || kp->key[1] == g_spv_key || kp->key[2] == g_spv_key)); kp->cull = g_no_cull ? 0 : S.poly.cull;
+    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
+    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
+    kp->front = ((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); kp->mode = S.poly.mode; kp->depth_clamp = S.depth_clamp;
+    kp->bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
+    if (var == 2) kp->bias_en = 0;
+    if (var == 8) kp->raster_discard = 1;   // no fragment shader in the pipeline
+    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    kp->dt = has_depth && S.ds.dt; kp->dw = S.ds.dw; kp->df = S.ds.df; kp->st = has_stencil && S.ds.st;
+    if (g_depth_func_fs && S.sh[1] && S.sh[1]->key == g_depth_func_fs) kp->df = (uint32_t)g_depth_func;
+    static int npl; if (!predict && g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs && npl++ < 60) VKLOG("logfs: present %llu pass %d (%ux%u, %llu draws before): depth attachment %d test %d (state %d) func %u write %u; depth range %.9g %.9g; viewport %.1f %.1f %.1f %.1f",
+        (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, has_depth, kp->dt, S.ds.dt, kp->df, kp->dw, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
+    // A depth buffer that a fragment shader wrote through gl_FragDepth: Adreno's early culling (LRZ) then rejects whole triangles of later draws that test it, in some frames
+    // and not others, with the same draws, state and depth contents. Hades II downsamples its scene depth into a 640x360 D24S8 with such a shader (Blit2DDepth), then
+    // draws its lights into it with the depth test on and no depth write: the lights went out in turn every 24-48 frames (whole halves of light quads missing in pass dumps),
+    // and Xenoblade Chronicles 3's cloud dome (its depth downsampled the same way) lost whole triangles. The light shader rewritten to write gl_FragDepth = gl_FragCoord.z
+    // (the same depth, tested after the shader) brought the pulses to 0 in 5 recordings, against 8-21; neither writing the depth image back by transfer (one texel or the
+    // whole image) nor waiting for the GPU after each submission changed them. So draws that test such a buffer (written in the last two presents) use that variant.
+    // Not with a depth bias (gl_FragCoord.z need not carry it). DM_VK_FDZ=0 (live): never
+    { vkimg_t *dim = has_depth ? P_att[8].im : NULL; vkshader_t *fsh = kp->raster_discard ? NULL : S.sh[1];
+      if (!predict && dim && fsh && fsh->depth_repl && kp->dt && kp->dw) dim->fdz_frame = g_tex_frame + 1;   // (a prediction leaves the depth image as it is)
+      kp->fdz = g_fdz && dim && fsh && !fsh->depth_repl && kp->dt && !kp->bias_en &&
+          ((dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2) || (g_fdz_fs && fsh->key == g_fdz_fs)); }
+    kp->sf[0] = S.ds.sf_f; kp->sf[1] = S.ds.sf_b; kp->sfail[0] = S.ds.fail_f; kp->szfail[0] = S.ds.zfail_f; kp->szpass[0] = S.ds.zpass_f; kp->sfail[1] = S.ds.fail_b; kp->szfail[1] = S.ds.zfail_b; kp->szpass[1] = S.ds.zpass_b;
+    // vertex input: every location the vertex shader reads
+    vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
+    uint32_t used_streams = 0; int need_zero = 0;
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(in_mask >> loc & 1)) continue;
+        va_st a; memcpy(&a, &S.vattr[loc], 4);
+        VkFormat f = a.fmt ? vertex_format(a.fmt, int_mask >> loc & 1, sint_mask >> loc & 1) : VK_FORMAT_UNDEFINED;
+        if (f == VK_FORMAT_UNDEFINED || !S.vbuf[a.stream].address) { kp->attr[kp->nattr++] = (typeof(kp->attr[0])){(uint32_t)loc, 16, int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
+        kp->attr[kp->nattr++] = (typeof(kp->attr[0])){(uint32_t)loc, a.stream, f, a.offset};
+        used_streams |= 1u << a.stream;
+    }
+    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) kp->bind[kp->nbind++] = (typeof(kp->bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
+    if (need_zero) kp->bind[kp->nbind++] = (typeof(kp->bind[0])){16, 0, 0, 0};
+    // attachments and blending
+    kp->ncol = (uint32_t)S.ncol; kp->dfmt = S.dfmt; kp->samples = S.samples ? S.samples : 1; kp->a2c = S.ms.a2c;
+    kp->logic_en = S.color.logic_op != 3 && S.color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
+    kp->logic_op = S.color.logic_op;
+    for (int i = 0; i < S.ncol; i++) {
+        kp->cfmt[i] = S.cfmt[i];
+        kp->wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
+        // Components outside the fragment shader's output map (SPH word 18; port of upstream 51ecd693b): the GPU leaves them as they were, the translator does not store them,
+        // and Vulkan would write them undefined. DM_VK_OMAP=0 (start-up): no such mask
+        { static int om = -1; if (om < 0) { const char *e = getenv("DM_VK_OMAP"); om = !(e && *e == '0'); }
+          if (om && kp->wmask[i] && S.sh[1]->omap_known) kp->wmask[i] &= S.sh[1]->omap >> (4 * i) & 0xf; }
+        const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
+        if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
+            kp->blend_en |= 1u << i;
+            kp->bl[i].src = S.blend[i].src_rgb; kp->bl[i].dst = S.blend[i].dst_rgb; kp->bl[i].srca = S.blend[i].src_a; kp->bl[i].dsta = S.blend[i].dst_a; kp->bl[i].eq = S.blend[i].eq_rgb; kp->bl[i].eqa = S.blend[i].eq_a;
+        }
+    }
+    if (S.ncol > 1 && P_att[0].im == &g_s0_image) { kp->wmask[0] = 0; kp->blend_en &= ~1u; }   // slot 0's scratch (DM_VK_SLOT0_FILL): nothing written there
+    if (g_mrt_active) { kp->wmask[1] = 0xf; kp->blend_en &= ~2u; } // probe output is independent of original output map/blend state
+    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
+    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
+    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
+    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
+    kp->dual = (kp->blend_en & 1) && S.sh[1] && !kp->raster_discard && (SRC1F(kp->bl[0].src) || SRC1F(kp->bl[0].dst) || SRC1F(kp->bl[0].srca) || SRC1F(kp->bl[0].dsta));
+    #undef SRC1F
+    // Maxwell's alpha test (nvnColorStateSetAlphaTest / SetAlphaRef): colour 0's alpha against the reference, the fragment dropped when the comparison fails. Not when colour 0
+    // is an integer target or absent (as OpenGL and nvn_mtl.m atest_key). Donkey Kong Bananza's Skills grid: ui2d clears each icon capture's rectangle of the UI target
+    // with a quad of alpha 0 and blending off under GREATER 0 before copying the rectangle; drawn without the test, every cell was an opaque black square
+    { uint32_t af = S.color.alpha_func; const vkfmt_t *f0 = S.ncol && S.rt_has_col[0] ? vk_fmt(S.rt_col[0].d.format) : NULL;
+      if (af >= 1 && af <= 7 && S.sh[1] && !kp->raster_discard && S.cfmt[0] && f0 && !f0->is_int) { kp->atest = af; if (af != 1) memcpy(&kp->aref, &S.alpha_ref, 4); if (kp->aref == 0x80000000u) kp->aref = 0; } }
+    kp->clip_neg1 = !g_depth_zero;
+}
 static int prepare_draw(int prim, int indexed) {
     if (g_mrt_active) mrt_abort(); // a previous selected draw returned before its GPU command
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
@@ -3906,78 +4125,8 @@ static int prepare_draw(int prim, int indexed) {
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
     if (g_no_cull < 0) g_no_cull = getenv("DM_VK_NOCULL") != NULL;
-    pkey k; memset(&k, 0, sizeof k);
-    for (int i = 0; i < 3; i++) k.key[i] = S.sh[i] ? S.sh[i]->key : 0;
-    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (k.key[0] == g_x_flat[i]) k.flat = (uint32_t)g_x_flat_mode[i] & 127;
-    k.topo = topo(prim); k.restart = S.prim_restart && (k.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
-    k.raster_discard = S.rast_discard; k.alt = (uint32_t)(g_spv_alt && (!g_spv_key || k.key[0] == g_spv_key || k.key[1] == g_spv_key || k.key[2] == g_spv_key)); k.cull = g_no_cull ? 0 : S.poly.cull;
-    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
-    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
-    k.front = ((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); k.mode = S.poly.mode; k.depth_clamp = S.depth_clamp;
-    k.bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
-    if (var == 2) k.bias_en = 0;
-    if (var == 8) k.raster_discard = 1;   // no fragment shader in the pipeline
-    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    k.dt = has_depth && S.ds.dt; k.dw = S.ds.dw; k.df = S.ds.df; k.st = has_stencil && S.ds.st;
-    if (g_depth_func_fs && S.sh[1] && S.sh[1]->key == g_depth_func_fs) k.df = (uint32_t)g_depth_func;
-    static int npl; if (g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs && npl++ < 60) VKLOG("logfs: present %llu pass %d (%ux%u, %llu draws before): depth attachment %d test %d (state %d) func %u write %u; depth range %.9g %.9g; viewport %.1f %.1f %.1f %.1f",
-        (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, has_depth, k.dt, S.ds.dt, k.df, k.dw, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
-    // A depth buffer that a fragment shader wrote through gl_FragDepth: Adreno's early culling (LRZ) then rejects whole triangles of later draws that test it, in some frames
-    // and not others, with the same draws, state and depth contents. Hades II downsamples its scene depth into a 640x360 D24S8 with such a shader (Blit2DDepth), then
-    // draws its lights into it with the depth test on and no depth write: the lights went out in turn every 24-48 frames (whole halves of light quads missing in pass dumps),
-    // and Xenoblade Chronicles 3's cloud dome (its depth downsampled the same way) lost whole triangles. The light shader rewritten to write gl_FragDepth = gl_FragCoord.z
-    // (the same depth, tested after the shader) brought the pulses to 0 in 5 recordings, against 8-21; neither writing the depth image back by transfer (one texel or the
-    // whole image) nor waiting for the GPU after each submission changed them. So draws that test such a buffer (written in the last two presents) use that variant.
-    // Not with a depth bias (gl_FragCoord.z need not carry it). DM_VK_FDZ=0 (live): never
-    { vkimg_t *dim = has_depth ? P_att[8].im : NULL; vkshader_t *fsh = k.raster_discard ? NULL : S.sh[1];
-      if (dim && fsh && fsh->depth_repl && k.dt && k.dw) dim->fdz_frame = g_tex_frame + 1;
-      k.fdz = g_fdz && dim && fsh && !fsh->depth_repl && k.dt && !k.bias_en &&
-          ((dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2) || (g_fdz_fs && fsh->key == g_fdz_fs)); }
-    k.sf[0] = S.ds.sf_f; k.sf[1] = S.ds.sf_b; k.sfail[0] = S.ds.fail_f; k.szfail[0] = S.ds.zfail_f; k.szpass[0] = S.ds.zpass_f; k.sfail[1] = S.ds.fail_b; k.szfail[1] = S.ds.zfail_b; k.szpass[1] = S.ds.zpass_b;
-    // vertex input: every location the vertex shader reads
-    vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
-    uint32_t used_streams = 0; int need_zero = 0;
-    for (int loc = 0; loc < 16; loc++) {
-        if (!(in_mask >> loc & 1)) continue;
-        va_st a; memcpy(&a, &S.vattr[loc], 4);
-        VkFormat f = a.fmt ? vertex_format(a.fmt, int_mask >> loc & 1, sint_mask >> loc & 1) : VK_FORMAT_UNDEFINED;
-        if (f == VK_FORMAT_UNDEFINED || !S.vbuf[a.stream].address) { k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, 16, int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
-        k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, a.stream, f, a.offset};
-        used_streams |= 1u << a.stream;
-    }
-    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
-    if (need_zero) k.bind[k.nbind++] = (typeof(k.bind[0])){16, 0, 0, 0};
-    // attachments and blending
-    k.ncol = (uint32_t)S.ncol; k.dfmt = S.dfmt; k.samples = S.samples ? S.samples : 1; k.a2c = S.ms.a2c;
-    k.logic_en = S.color.logic_op != 3 && S.color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
-    k.logic_op = S.color.logic_op;
-    for (int i = 0; i < S.ncol; i++) {
-        k.cfmt[i] = S.cfmt[i];
-        k.wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
-        // Components outside the fragment shader's output map (SPH word 18; port of upstream 51ecd693b): the GPU leaves them as they were, the translator does not store them,
-        // and Vulkan would write them undefined. DM_VK_OMAP=0 (start-up): no such mask
-        { static int om = -1; if (om < 0) { const char *e = getenv("DM_VK_OMAP"); om = !(e && *e == '0'); }
-          if (om && k.wmask[i] && S.sh[1]->omap_known) k.wmask[i] &= S.sh[1]->omap >> (4 * i) & 0xf; }
-        const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
-        if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
-            k.blend_en |= 1u << i;
-            k.bl[i].src = S.blend[i].src_rgb; k.bl[i].dst = S.blend[i].dst_rgb; k.bl[i].srca = S.blend[i].src_a; k.bl[i].dsta = S.blend[i].dst_a; k.bl[i].eq = S.blend[i].eq_rgb; k.bl[i].eqa = S.blend[i].eq_a;
-        }
-    }
-    if (S.ncol > 1 && P_att[0].im == &g_s0_image) { k.wmask[0] = 0; k.blend_en &= ~1u; }   // slot 0's scratch (DM_VK_SLOT0_FILL): nothing written there
-    if (g_mrt_active) { k.wmask[1] = 0xf; k.blend_en &= ~2u; } // probe output is independent of original output map/blend state
-    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
-    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
-    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
-    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
-    k.dual = (k.blend_en & 1) && S.sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta));
-    #undef SRC1F
-    // Maxwell's alpha test (nvnColorStateSetAlphaTest / SetAlphaRef): colour 0's alpha against the reference, the fragment dropped when the comparison fails. Not when colour 0
-    // is an integer target or absent (as OpenGL and nvn_mtl.m atest_key). Donkey Kong Bananza's Skills grid: ui2d clears each icon capture's rectangle of the UI target
-    // with a quad of alpha 0 and blending off under GREATER 0 before copying the rectangle; drawn without the test, every cell was an opaque black square
-    { uint32_t af = S.color.alpha_func; const vkfmt_t *f0 = S.ncol && S.rt_has_col[0] ? vk_fmt(S.rt_col[0].d.format) : NULL;
-      if (af >= 1 && af <= 7 && S.sh[1] && !k.raster_discard && S.cfmt[0] && f0 && !f0->is_int) { k.atest = af; if (af != 1) memcpy(&k.aref, &S.alpha_ref, 4); if (k.aref == 0x80000000u) k.aref = 0; } }
-    k.clip_neg1 = !g_depth_zero;
+    pkey k; pkey_fill(&k, prim, indexed, var, 0);
+    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     // layout and pipeline
     VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;   // set 0: the texture table (the same layout in every graphics pipeline layout, so a bound table set outlives pipeline changes)
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { dsl[S.sh[st]->set] = S.sh[st]->dsl; if (S.sh[st]->set + 1 > nsets) nsets = S.sh[st]->set + 1; }
@@ -5117,7 +5266,8 @@ static void dispatch(const p_dispatch *d) {
     g_vkst.dispatches++;
     vk_end_pass_land();
     stage_storage_prepare(5, cs);
-    VkCommandBuffer cb = vk_cmd();
+    extern int g_cs_chain, g_cs_in_disp; extern uint64_t g_cs_free, g_cs_first; int vk_cs_game(void), vk_cs_chained(VkCommandBuffer cb); void vk_cs_chain_open(VkCommandBuffer cb);
+    g_cs_in_disp = 1; VkCommandBuffer cb = vk_cmd(); g_cs_in_disp = 0;   // (a run of dispatches stays open across this one: gfx_vk_core.c vk_cmd; anything the set-up below records closes it)
     VkDescriptorSetLayout dsl[VK_NSETS] = {cs->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     // the group counts before the descriptors: the driver segment stage_set builds carries them at c0 + 0x200 (drv_segment), as nvn_mtl.m's does. Set after it, every
     // dispatch read the previous one's: Link's Awakening's light culling (tile = workgroup y × c0[0x200] + workgroup x) ran after a 2x1x1 dispatch, so of its 30x17
@@ -5160,7 +5310,9 @@ static void dispatch(const p_dispatch *d) {
     if (p == (void *)1) { if (selected_trace) VKLOG("compute trace key %016llx returned: pipeline unavailable", (unsigned long long)cs->key); return; }
     if (g_cs_images_n) cs_trace_images_copy(cb, cs->key, 0);
     if (g_cs_buffers_n) cs_trace_buffers_copy(cb, cs->key, 0);
-    vk_img_barrier_all(cb);
+    int cs_plain = vk_cs_game() && !g_cs_images_n && !g_cs_buffers_n && !g_x_nodispbar;   // (the trace copies record around the dispatch)
+    if (cs_plain && !d->ind && vk_cs_chained(cb)) g_cs_free++;   // the command before this one is a dispatch, with no barrier of the game's since; an indirect one reads counts a dispatch may have written
+    else { g_cs_chain = 0; vk_img_barrier_all(cb); g_cs_first++; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)cs->ndyn, dofs);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);   // DM_VK_PASS_TIMES: dispatches are timed as passes
@@ -5185,7 +5337,8 @@ static void dispatch(const p_dispatch *d) {
     if (g_cs_buffers_n && dispatched) cs_trace_buffers_copy(cb, cs->key, 1);
     if (selected_trace) VKLOG("compute trace key %016llx native dispatch %s%s", (unsigned long long)cs->key,
         dispatched ? "recorded" : "not recorded: indirect buffer unavailable", dispatched && d->ind ? " (indirect counts remain GPU-owned)" : "");
-    if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
+    if (cs_plain) vk_cs_chain_open(cb);   // the barrier after it waits for the next command of another kind (vk_cmd)
+    else if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
     crumb_dispatch(cs->key);
     if (g_x_tracepass == -2 || mdi_log_now()) {   // (DM_VK_TRACE_PASS=-2 lists the dispatches too, with their storage buffers: the addresses for a DM_CTL memdump)
         char sb[512]; int o = 0; for (int r = 0; r < 16 && o < (int)sizeof sb - 40; r++) if (S.ssbo[5][r].addr) o += snprintf(sb + o, sizeof sb - (size_t)o, " s%d %#llx+%#llx", r, (unsigned long long)S.ssbo[5][r].addr, (unsigned long long)S.ssbo[5][r].size);
@@ -5513,6 +5666,7 @@ static int depth_scale(VkCommandBuffer cb, vkimg_t *s, vkimg_t *d, VkImageSubres
     S.bound_pipe = VK_NULL_HANDLE;   // the compute pipeline took the bind point the replay's dispatches use
     return 1;
 }
+enum { CF_MIRROR_X = 4, CF_MIRROR_Y = 8 };   // NVNcopyFlags (copy_t2t)
 static void copy_t2t(const p_copy_t2t *c) {
     vk_end_pass();
     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
@@ -5525,6 +5679,11 @@ static void copy_t2t(const p_copy_t2t *c) {
     int32_t sw = (int32_t)(s->w >> ss.mipLevel ? s->w >> ss.mipLevel : 1), sh = (int32_t)(s->h >> ss.mipLevel ? s->h >> ss.mipLevel : 1);
     int32_t dw = (int32_t)(d->w >> ds.mipLevel ? d->w >> ds.mipLevel : 1), dh = (int32_t)(d->h >> ds.mipLevel ? d->h >> ds.mipLevel : 1);
     p_copy_t2t k = *c; c = &k; d->gpu_w = 1;
+    // NVNcopyFlags: LINEAR_FILTER 1, ENGINE_2D 2 (nothing to do here), MIRROR_X 4, MIRROR_Y 8, MIRROR_Z 0x10: a mirrored copy is a blit with the destination's offsets
+    // swapped. Pokémon Sword 1.3.2 captures its picture for a door's fade with MIRROR_Y (its lower-left origin image turned over) and draws it back; copied
+    // unmirrored, the fade showed the room upside down for 7 frames (Odin 2, 2026-11-13)
+    int mir = (int)(k.flags & (CF_MIRROR_X | CF_MIRROR_Y));
+    if (k.flags & ~(DM_COPY_RESOLVE | 1u | 2u | CF_MIRROR_X | CF_MIRROR_Y)) VKRED_ONCE(77, "texture copy flags %#x: mirror Z (or an unknown bit) not done", k.flags & ~DM_COPY_RESOLVE);
     if (k.sr.height <= 0) k.sr.height = 1; if (k.dr.height <= 0) k.dr.height = 1;
     if (ss.mipLevel >= s->levels || ds.mipLevel >= d->levels || k.sr.xoffset < 0 || k.sr.yoffset < 0 || k.dr.xoffset < 0 || k.dr.yoffset < 0 || k.sr.xoffset >= sw || k.sr.yoffset >= sh || k.dr.xoffset >= dw || k.dr.yoffset >= dh) {
         VKRED_ONCE(72, "texture copy outside its images (src %dx%d @%d,%d of %dx%d level %u, dst %dx%d @%d,%d of %dx%d level %u): skipped", c->sr.width, c->sr.height, c->sr.xoffset, c->sr.yoffset, sw, sh, ss.mipLevel,
@@ -5535,25 +5694,27 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (k.dr.xoffset + k.dr.width > dw) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.width = dw - k.dr.xoffset; if (same) k.sr.width = k.dr.width; }
     if (k.dr.yoffset + k.dr.height > dh) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.height = dh - k.dr.yoffset; if (same) k.sr.height = k.dr.height; }
     if (k.sr.width <= 0 || k.sr.height <= 0 || k.dr.width <= 0 || k.dr.height <= 0) { vk_img_barrier_all(cb); return; }
-    if (!(c->flags & DM_COPY_RESOLVE) && !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt)) {   // a blit: both formats must allow it (and linear filtering)
+    if (!(c->flags & DM_COPY_RESOLVE) && (mir || !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt))) {   // a blit: both formats must allow it (and linear filtering)
         VkFormatProperties sp, dp; vkGetPhysicalDeviceFormatProperties(V.pd, s->fmt, &sp); vkGetPhysicalDeviceFormatProperties(V.pd, d->fmt, &dp);
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || (s->aspect != d->aspect)) {
             if (depth_scale(cb, s, d, ss, ds, &k)) return;
             VKRED_ONCE(75, "texture blit between formats %d → %d that cannot be blitted (%dx%d → %dx%d, present %llu): skipped", s->fmt, d->fmt, k.sr.width, k.sr.height, k.dr.width, k.dr.height, (unsigned long long)g_tex_frame); vk_img_barrier_all(cb); return; }
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || (s->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) k.flags &= ~1u;   // nearest where linear is not allowed
     }
-    if (s == d && !memcmp(&ss, &ds, sizeof ss) && k.sr.xoffset == k.dr.xoffset && k.sr.yoffset == k.dr.yoffset && k.sr.width == k.dr.width && k.sr.height == k.dr.height && k.sr.zoffset == k.dr.zoffset) {
+    if (!mir && s == d && !memcmp(&ss, &ds, sizeof ss) && k.sr.xoffset == k.dr.xoffset && k.sr.yoffset == k.dr.yoffset && k.sr.width == k.dr.width && k.sr.height == k.dr.height && k.sr.zoffset == k.dr.zoffset) {
         vk_img_barrier_all(cb); return; }   // a copy of a region onto itself (two textures over the same storage): nothing to do, and Vulkan forbids overlapping copies
     if (c->flags & DM_COPY_RESOLVE) {
         VkImageResolve r = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
         vkCmdResolveImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-    } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt) {
+    } else if (!mir && c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt) {
         VkImageCopy r = {ss, {c->sr.xoffset, c->sr.yoffset, s->layers > 1 ? 0 : c->sr.zoffset}, ds, {c->dr.xoffset, c->dr.yoffset, d->layers > 1 ? 0 : c->dr.zoffset},
                          {(uint32_t)c->sr.width, (uint32_t)(c->sr.height ? c->sr.height : 1), s->layers > 1 ? 1 : (uint32_t)(c->sr.depth ? c->sr.depth : 1)}};
         vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {
         VkImageBlit r = {ss, {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + (c->sr.height ? c->sr.height : 1), 1}},
                          ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + (c->dr.height ? c->dr.height : 1), 1}}};
+        if (mir & CF_MIRROR_X) { int32_t x = r.dstOffsets[0].x; r.dstOffsets[0].x = r.dstOffsets[1].x; r.dstOffsets[1].x = x; }
+        if (mir & CF_MIRROR_Y) { int32_t y = r.dstOffsets[0].y; r.dstOffsets[0].y = r.dstOffsets[1].y; r.dstOffsets[1].y = y; }
         vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, (c->flags & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     vk_img_barrier_all(cb);
@@ -5658,14 +5819,14 @@ static void exec_ops(const uint8_t *p, const uint8_t *end);
 // on the debug build's libdmhost.so. Simpleperf is refused on retail devices; this found the command pool resets and render pass begins that took half the replay
 #include <signal.h>
 #include <sys/syscall.h>
-static _Atomic uint64_t g_prof_pc[16384], g_prof_leaf[16384], g_prof_lr[16384], g_prof_st[16384][6]; static _Atomic uint32_t g_prof_n; static uintptr_t g_prof_lo, g_prof_hi;   // this library's text, for the first frame of ours
+static _Atomic uint64_t g_prof_pc[16384], g_prof_leaf[16384], g_prof_lr[16384], g_prof_st[16384][6]; static _Atomic uint32_t g_prof_tid[16384]; static _Atomic uint32_t g_prof_n; static uintptr_t g_prof_lo, g_prof_hi;   // this library's text, for the first frame of ours
 static void prof_sig(int sig, siginfo_t *si, void *ucv) { (void)sig; (void)si; ucontext_t *u = ucv; uint64_t pc = u->uc_mcontext.pc;
     if (pc < g_prof_lo || pc >= g_prof_hi) {   // outside this library: charge it to our first caller on the frame chain (marked with bit 63)
         uint64_t lr = u->uc_mcontext.regs[30] & 0x7fffffffffull, fp = u->uc_mcontext.regs[29], sp = u->uc_mcontext.sp, c = 0;
         if (lr >= g_prof_lo && lr < g_prof_hi) c = lr;
         for (int k = 0; k < 12 && !c && fp && !(fp & 7) && fp >= sp && fp - sp < 0x400000; k++) { uint64_t r = ((const uint64_t *)(uintptr_t)fp)[1] & 0x7fffffffffull; if (r >= g_prof_lo && r < g_prof_hi) c = r; fp = ((const uint64_t *)(uintptr_t)fp)[0]; }
         if (c) pc = c | (1ull << 63); }
-    uint32_t i = atomic_fetch_add(&g_prof_n, 1); if (i < 16384) { atomic_store(&g_prof_pc[i], pc); atomic_store(&g_prof_leaf[i], u->uc_mcontext.pc); atomic_store(&g_prof_lr[i], u->uc_mcontext.regs[30]);
+    uint32_t i = atomic_fetch_add(&g_prof_n, 1); if (i < 16384) { atomic_store(&g_prof_pc[i], pc); atomic_store(&g_prof_leaf[i], u->uc_mcontext.pc); atomic_store(&g_prof_lr[i], u->uc_mcontext.regs[30]); atomic_store(&g_prof_tid[i], (uint32_t)syscall(SYS_gettid));
         uint64_t fp = u->uc_mcontext.regs[29], sp = u->uc_mcontext.sp;   // the frame chain's return addresses (DM_VK_PROF_OUT)
         for (int k = 0; k < 6; k++) { uint64_t r = 0; if (fp && !(fp & 7) && fp >= sp && fp - sp < 0x400000) { r = ((const uint64_t *)(uintptr_t)fp)[1] & 0x7fffffffffull; fp = ((const uint64_t *)(uintptr_t)fp)[0]; } else fp = 0; atomic_store(&g_prof_st[i][k], r); } } }
 static void prof_tick(void) {
@@ -5673,15 +5834,20 @@ static void prof_tick(void) {
     static int on; static unsigned chk; static uint64_t last; if (!on && !(chk++ & 63)) { const char *e = getenv("DM_VK_PROF"); on = e && atoi(e);
         if (on) { Dl_info d0; if (dladdr((void *)prof_tick, &d0)) { g_prof_lo = (uintptr_t)d0.dli_fbase; g_prof_hi = g_prof_lo + 0x4000000; }
             struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = prof_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigaction(SIGPROF, &sa, NULL);
-            // DM_VK_PROF_TID=<tid>: sample that thread of the process instead (its CPU-time clock; e.g. the game's main thread), and DM_VK_PROF_OUT=<file>: append the raw samples (leaf pc, lr) there
+            // DM_VK_PROF_TID=<tid>: sample that thread of the process instead (its CPU-time clock; e.g. the game's main thread), and DM_VK_PROF_OUT=<file>: append the raw samples (leaf pc, lr) there.
+            // DM_VK_PROF_TID=all: every thread, by the process's CPU time (4 ms; the signal goes to the thread running when the timer expires), for the game's own threads,
+            // whose IDs are not known before the launch; the raw samples carry the thread ID
             const char *tt = getenv("DM_VK_PROF_TID"); pid_t tid = tt && atoi(tt) > 0 ? (pid_t)atoi(tt) : (pid_t)syscall(SYS_gettid);
             clockid_t clk = tt && atoi(tt) > 0 ? (clockid_t)((~(unsigned)tid << 3) | 6) : CLOCK_THREAD_CPUTIME_ID;   // Linux MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)
             struct sigevent ev; memset(&ev, 0, sizeof ev); ev.sigev_notify = SIGEV_THREAD_ID; ev.sigev_signo = SIGPROF; ev._sigev_un._tid = tid;
-            timer_t tm; if (!timer_create(clk, &ev, &tm)) { struct itimerspec it = {{0, 1000000}, {0, 1000000}}; timer_settime(tm, 0, &it, NULL); VKLOG("[prof] sampling thread %d every 1 ms of its CPU time", (int)tid); } else VKLOG("[RED] [prof] timer_create for thread %d failed", (int)tid); } }
+            int all = tt && !strcmp(tt, "all"); if (all) { clk = CLOCK_PROCESS_CPUTIME_ID; ev.sigev_notify = SIGEV_SIGNAL; ev._sigev_un._tid = 0; }
+            timer_t tm; if (!timer_create(clk, &ev, &tm)) { struct itimerspec it = {{0, all ? 4000000 : 1000000}, {0, all ? 4000000 : 1000000}}; timer_settime(tm, 0, &it, NULL); if (all) VKLOG("[prof] sampling every thread, every 4 ms of the process's CPU time"); else VKLOG("[prof] sampling thread %d every 1 ms of its CPU time", (int)tid); } else VKLOG("[RED] [prof] timer_create for thread %d failed", (int)tid); } }
     if (!on) return; uint64_t now = tnow(); if (!last) last = now; if (now - last < 20000000000ull) return; last = now;
     uint32_t n = atomic_exchange(&g_prof_n, 0); if (n > 16384) n = 16384;
     { const char *po = getenv("DM_VK_PROF_OUT"); FILE *pf = po ? fopen(po, "ab") : NULL;
-      if (pf) { for (uint32_t i = 0; i < n; i++) { uint64_t v[8] = {atomic_load(&g_prof_leaf[i]), atomic_load(&g_prof_lr[i])}; for (int k = 0; k < 6; k++) v[2 + k] = atomic_load(&g_prof_st[i][k]); fwrite(v, sizeof v, 1, pf); } fclose(pf); } }
+      if (pf) { for (uint32_t i = 0; i < n; i++) { uint64_t v[10] = {atomic_load(&g_prof_leaf[i]), atomic_load(&g_prof_lr[i])}; for (int k = 0; k < 6; k++) v[2 + k] = atomic_load(&g_prof_st[i][k]);
+          v[8] = atomic_load(&g_prof_tid[i]); v[9] = now; fwrite(v, sizeof v, 1, pf); }   // + the thread, and the time of the write (tnow; the samples are the 20 s before it)
+          fclose(pf); } }
     Dl_info di; uintptr_t base = dladdr((void *)prof_tick, &di) ? (uintptr_t)di.dli_fbase : 0;
     static uint64_t pcs[16384]; static uint32_t cnt[16384]; int np = 0;
     static int leaves = -1; if (leaves < 0) { const char *e = getenv("DM_VK_PROF"); leaves = e && atoi(e) == 2; }   // DM_VK_PROF=2: where the time is, not who called
@@ -5707,6 +5873,105 @@ void mtl_exec_span(const uint8_t *p, const uint8_t *end) {
     exec_ops(p, end);
     g_vkst.ns_exec += tnow() - t0;
 }
+// predict_rest at a render target change (upstream pso_predict_rest_ does the same at OP_SET_RT): the new attachments' formats, samples and aspect as begin_pass
+// would take them, from the record (vk_rt_predict: no image or view made, no pass ended, no commands), so the walk goes on into the passes after it. An area load
+// (Kirby and the Forgotten Land, 2026-11-12 21:53: 68 passes in one submission, many of one draw, 51 pipelines built on the replay thread in 1.2 s) has its misses
+// spread over many passes: a walk that stopped at the next target change queued none of them. The colour alias map (one image in two slots) is not predicted
+static void pred_set_rt(const p_set_rt *r) {
+    S.rt_n = r->n > 8 ? 8 : r->n; int ncol = 0, have = 0; uint32_t samples = 1;
+    for (int i = 0; i < 8; i++) S.cfmt[i] = VK_FORMAT_UNDEFINED;
+    P_att[0].im = P_att[8].im = NULL;
+    for (int i = 0; i < S.rt_n; i++) {
+        S.rt_has_col[i] = r->color[i] != NULL && r->color[i]->magic == MAGIC('T', 'E', 'X', 0); if (S.rt_has_col[i]) S.rt_col[i] = *r->color[i];
+        S.rt_has_cview[i] = r->has_cview[i]; if (r->has_cview[i]) S.rt_cview[i] = r->cview[i];
+        VkFormat f; uint32_t sm; VkImageAspectFlags as; vkimg_t *im;
+        if (S.rt_has_col[i] && vk_rt_predict(&S.rt_col[i], S.rt_has_cview[i] ? &S.rt_cview[i] : NULL, &f, &sm, &as, &im)) { S.cfmt[i] = f; ncol = i + 1; samples = sm; have = 1; }
+    }
+    S.rt_has_dep = r->depth != NULL && r->depth->magic == MAGIC('T', 'E', 'X', 0); if (S.rt_has_dep) S.rt_dep = *r->depth;
+    S.rt_has_dview = r->has_dview; if (r->has_dview) S.rt_dview = r->dview;
+    S.dfmt = VK_FORMAT_UNDEFINED; S.daspect = 0;
+    { VkFormat f; uint32_t sm; VkImageAspectFlags as; vkimg_t *im;
+      if (S.rt_has_dep && vk_rt_predict(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, &f, &sm, &as, &im)) { S.dfmt = f; S.daspect = as; samples = sm; have = 1; P_att[8].im = im; } }
+    if (have && slot0_fill_wanted(ncol, S.cfmt[0] != VK_FORMAT_UNDEFINED, samples, 1)) { S.cfmt[0] = VK_FORMAT_R8G8B8A8_UNORM; P_att[0].im = &g_s0_image; }
+    S.ncol = have ? ncol : 0; S.samples = samples;
+}
+// Batch (upstream nxnative 6a6a018df pso_predict_rest_): at a pipeline miss, the ops after the current one (the rest of its command buffer, of the buffers that called
+// it, and of the submission's later ones, as occ_reset_next reads them) are walked on a copy of the bound state, across render target changes (pred_set_rt). Each
+// draw's key is made as prepare_draw makes it; the missing ones go to the background threads (apq_push), so the other new pipelines of an effect or an area load are
+// being built while its first one is, not one after another as their draws come. A prediction that no draw takes is not recorded (pred_taken). No GPU commands, no
+// pass changes, S and the attachments as they were afterwards. One walk per submission (or stretch between counter ops), and another at a miss past the draw where
+// the last walk stopped (its cap, DM_VK_BATCH_MAX keys, default 64, or its read limit). DM_VK_BATCH_PIPE=0 turns it off
+static int g_pred_walks, g_pred_last_queued;   // (tests)
+static void predict_rest(const pkey *cur) {
+    static int on = -1, mx; static uint32_t epoch = ~0u; static int until = -1; extern const uint64_t *vk_rest_h; extern int vk_rest_n;
+    if (on < 0) { const char *e = getenv("DM_VK_BATCH_PIPE"); on = !(e && *e == '0') && g_async_pipe; e = getenv("DM_VK_BATCH_MAX"); mx = e ? atoi(e) : 64; if (mx > APQ / 2) mx = APQ / 2; }
+    if (!on || mx <= 0) return;
+    if (epoch == g_la_epoch && (until < 0 || g_draw_i < until)) return;   // walked: to the end (until -1), or this miss lies within the last walk's reach (a misprediction)
+    epoch = g_la_epoch; until = -1;
+    if (!g_la_at || g_la_depth > 16 || g_la_span) return;
+    static __typeof__(S) save; memcpy(&save, &S, sizeof S);
+    static __typeof__(P_att) psave; memcpy(&psave, &P_att, sizeof P_att);
+    uint64_t t0 = tick(); int queued = 0, draws = 0, nall = 0, stopped = 1; g_pred_walks++;
+    const uint8_t *p = g_la_at, *loc[32]; int nl = 0, up = g_la_depth, rest = 0;
+    for (int left = 200000; left > 0 && queued < mx && draws < 4096; left--) {   // (stopped stays 1 when a limit ends the walk)
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8; int prim = -1, indexed = 0;
+        switch (h.op) {
+        case OP_END: if (nl) { p = loc[--nl]; continue; } if (up) { p = g_la_ret[--up]; continue; }
+            if (rest < vk_rest_n && vk_rest_h[rest]) { p = (const uint8_t *)(uintptr_t)vk_rest_h[rest++]; continue; }
+            stopped = 0; goto done;   // the submission's end: all of it read
+        case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (nl == 32 || !t) goto done; loc[nl++] = p + h.size; p = (const uint8_t *)(uintptr_t)t; continue; }
+        case OP_SET_RT: pred_set_rt((const p_set_rt *)a); break;   // the passes after it are read with their own attachments
+        case OP_VIEWPORTS: { const p_viewports *v = (const p_viewports *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 16); break; }
+        case OP_BIND_PROGRAM: bind_program((const p_bind_program *)a); break;
+        case OP_BIND_STATE: { const p_bind_state *bs = (const p_bind_state *)a;
+            switch (bs->kind) {
+            case 0: { blend_st b; memcpy(&b, bs->bytes, sizeof b); if (b.target < 8) S.blend[b.target] = b; break; }
+            case 1: memcpy(&S.color, bs->bytes, sizeof S.color); break;
+            case 2: memcpy(&S.chmask, bs->bytes, sizeof S.chmask); break;   // (bind_chmask may end the pass: the mask alone here)
+            case 3: memcpy(&S.ms, bs->bytes, sizeof S.ms); break;
+            case 4: memcpy(&S.poly, bs->bytes, sizeof S.poly); break;
+            case 5: memcpy(&S.ds, bs->bytes, sizeof S.ds); break;
+            }
+            break; }
+        case OP_BIND_VATTR: { const p_bind_vattr *v = (const p_bind_vattr *)a; memset(S.vattr, 0, sizeof S.vattr); for (int i = 0; i < v->n && i < 16; i++) S.vattr[v->first + i] = v->st[i]; break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *v = (const p_bind_vstream *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vstream[v->first + i] = v->st[i]; break; }
+        case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t1; const p_bind_vbuf *v = vbuf_rec(h.op, a, &t1); for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i]; break; }
+        case OP_STENCIL: { const p_stencil *st = (const p_stencil *)a;
+            for (int f = 0; f < 2; f++) if (st->face & (1 << f)) { if (st->which == 0) S.smask[f] = st->value_mask; else if (st->which == 1) S.swmask[f] = st->mask; else S.sref[f] = st->ref; }
+            break; }
+        case OP_POLY_OFFSET: S.pofs = *(const p_poly_offset *)a; break;
+        case OP_ALPHA_REF: S.alpha_ref = ((const p_alpha_ref *)a)->ref; break;
+        case OP_BLEND_COLOR: memcpy(S.blendc, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
+        case OP_PRIM_RESTART: S.prim_restart = ((const p_prim_restart *)a)->on; break;
+        case OP_DRAW: memcpy(&prim, a, 4); break;
+        case OP_DRAW_IDX: memcpy(&prim, a, 4); indexed = 1; break;
+        case OP_MULTI_DRAW: { const p_multi_draw *m = (const p_multi_draw *)a; prim = m->prim; indexed = m->itype >= 0; break; }
+        default: break;
+        }
+        if (prim >= 0) nall++;   // (every draw: g_draw_i counts them so)
+        if (prim >= 0 && prim != DM_PRIM_MESH_TASKS && S.sh[0] && !S.sh[3] && !S.sh[4] && !S.rast_discard) {
+            draws++;
+            pkey k; pkey_fill(&k, prim, indexed, 0, 1);
+            if (k.key[0] == cur->key[0] && k.key[1] == cur->key[1] && k.key[2] == cur->key[2]) { memcpy(k.um, cur->um, sizeof k.um); memcpy(k.im, cur->im, sizeof k.im); }
+            if (!k.alt && !k.flat && memcmp(&k, cur, sizeof k)) {
+                pthread_mutex_lock(&g_pipe_mu); int miss = !nvn_hm_get(&g_pipes, &k); pthread_mutex_unlock(&g_pipe_mu);
+                if (miss && apq_push(&k)) { queued++;   // (a build done before the mark is recorded at once: harmless)
+                    pthread_mutex_lock(&g_pipe_mu); if (nvn_hm_get(&g_pipes, &k) == PIPE_PENDING) nvn_hm_put(&g_pred, &k, (void *)1); pthread_mutex_unlock(&g_pipe_mu); }
+                else if (miss) goto done;   // the queue is full (stopped: a later miss walks again)
+            }
+        }
+        if (h.size < sizeof h) break;
+        p += h.size;
+    }
+done:
+    memcpy(&S, &save, sizeof S); memcpy(&P_att, &psave, sizeof P_att);
+    if (stopped) until = g_draw_i + nall;   // a miss past the draws read walks again
+    g_pred_last_queued = queued;
+    { static int n; static uint64_t tq; tq += queued; if (queued && (n++ < 16 || n % 64 == 0)) VKLOG("batch: %d pipelines of the rest of the submission queued ahead of their draws (%d draws read%s, %.2f ms; %llu queued, %llu taken so far)", queued, draws, stopped ? ", stopped at the cap" : "", (tick() - t0) / 1e6, (unsigned long long)tq, (unsigned long long)g_pred_hit); }
+}
 static void exec_ops(const uint8_t *p, const uint8_t *end) {
     for (;;) {
         if (end && p >= end) return;
@@ -5721,9 +5986,11 @@ static void exec_ops(const uint8_t *p, const uint8_t *end) {
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (g_la_depth < 16) g_la_ret[g_la_depth] = p + h.size; g_la_depth++; exec_ops((const uint8_t *)(uintptr_t)t, NULL); g_la_depth--; break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
-        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); g_la_epoch++; mtl_sub_counter(ad, (uint32_t)t); break; }
+        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); if (g_x_tracepass == -2) VKLOG("--- report counter type %#llx to %#llx", (unsigned long long)t, (unsigned long long)ad); g_la_epoch++; mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_la_epoch++; if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset(); break; }
-        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = mtl_last_fence() + 1; s->fenced = 1; break; }
+        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8);
+            if (!sync_replay_fence(s, mtl_last_fence() + 1)) { static int n; if (n++ < 4) VKLOG("fence on sync %p skipped: the game has finalized or freed it (nvn_obj.h sync_replay_fence)", (void *)s); }
+            break; }
         // Upstream's queue waits (hle_nvn.c nvnCommandBufferWaitEvent / WaitSync, ea0c98df3): the Apple scheduler parks the queue on them; this replay runs
         // submissions in their order and does not wait, as when the calls were no-ops. An event wait whose predicate does not hold yet is named once (an
         // ordering the logical queues would change: Ocarina of Time's lighting producer and consumer)

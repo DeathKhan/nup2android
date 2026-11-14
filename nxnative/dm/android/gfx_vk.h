@@ -176,6 +176,7 @@ struct vkimg {
     uint64_t vkbytes;                 // the image's device memory (vkGetImageMemoryRequirements size): what the texture budget counts (gfx_vk_budget.c)
     uint64_t zc_gen;                  // a texture over a movie picture slot (movie_zc_vk.c zc_tex_refresh): the slot's change count last converted into it
 };
+int vk_rt_predict(const tex_t *t, const view_t *vw, VkFormat *fmt, uint32_t *samples, VkImageAspectFlags *aspect, vkimg_t **img_out);   // a render target's attachment format, samples and aspect, its image if made (nothing made; gfx_vk_exec.c predict_rest)
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
 int vk_tex_storage_prepare(const tex_t *t, const view_t *view);                    // before descriptor collection/render pass: preserve contents when adding storage usage
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
@@ -191,7 +192,9 @@ VkImageView vk_dummy_view(int dim, int arrayed, int ms, int storage, int is_int)
 VkSampler vk_dummy_sampler(void);
 VkBufferView vk_dummy_tbuf(int storage);
 void vk_end_pass_land(void);   // vk_end_pass, then the deferred uniform updates land (before copies, dispatches, the submission's end)
-void vk_img_barrier_all(VkCommandBuffer cb);   // version 1: one global memory barrier (all images stay in GENERAL)
+void vk_img_barrier_site(VkCommandBuffer cb, const char *file, int line);   // TEMPORARY (barrier census): counted by call site, DM_VK_X_NOBAR
+#define vk_img_barrier_all(cb) vk_img_barrier_site(cb, __FILE__, __LINE__)
+//   // version 1: one global memory barrier (all images stay in GENERAL)
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im);   // first use: transition from UNDEFINED to GENERAL (and upload a packaged texture)
 // ---- texture memory budget (gfx_vk_budget.c): the images' device memory kept under DM_VK_IMAGE_BUDGET_MB by dropping the least recently drawn ----
 typedef struct { void *h; uint32_t i; vkimg_t *im; } vk_img_ref;   // an image and where its table holds it (gfx_vk_tex.c)
